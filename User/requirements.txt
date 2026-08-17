@@ -1,0 +1,5 @@
+streamlit
+langchain-community
+langchain-aws
+faiss-cpu
+boto3
