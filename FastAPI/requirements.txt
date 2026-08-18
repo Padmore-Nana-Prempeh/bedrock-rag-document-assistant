@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+python-multipart
+pypdf
+boto3
+langchain-community
+langchain-aws
+langchain-text-splitters
+faiss-cpu
