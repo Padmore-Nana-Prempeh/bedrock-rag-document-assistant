@@ -1,10 +1,13 @@
+import hashlib
 import os
 import shutil
+import time
 import uuid
 from pathlib import Path
 
 import boto3
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from botocore.exceptions import ClientError
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
@@ -27,6 +30,16 @@ BEDROCK_MODEL_ID = os.getenv(
 )
 
 MAX_FILE_SIZE = 10 * 1024 * 1024  # 10 MB
+
+UPLOAD_LIMIT = 2
+QUESTION_LIMIT = 20
+RATE_LIMIT_WINDOW_SECONDS = 24 * 60 * 60  # 24 hours
+
+RATE_LIMIT_TABLE = os.getenv(
+    "RATE_LIMIT_TABLE",
+    "bedrock-rag-demo-rate-limits",
+)
+
 TEMP_ROOT = Path("/tmp/rag_sessions")
 
 TEMP_ROOT.mkdir(parents=True, exist_ok=True)
@@ -38,6 +51,11 @@ TEMP_ROOT.mkdir(parents=True, exist_ok=True)
 
 s3_client = boto3.client(
     "s3",
+    region_name=AWS_REGION,
+)
+
+dynamodb_client = boto3.client(
+    "dynamodb",
     region_name=AWS_REGION,
 )
 
@@ -92,6 +110,204 @@ def get_session_directory(document_id: str) -> Path:
     session_dir = TEMP_ROOT / document_id
     session_dir.mkdir(parents=True, exist_ok=True)
     return session_dir
+
+
+def get_client_ip(request: Request) -> str:
+    forwarded_for = request.headers.get("x-forwarded-for")
+
+    if forwarded_for:
+        return forwarded_for.split(",")[-1].strip()
+
+    if request.client:
+        return request.client.host
+
+    return "unknown"
+
+
+def get_visitor_id(request: Request) -> str:
+    client_ip = get_client_ip(request)
+
+    return hashlib.sha256(
+        client_ip.encode("utf-8")
+    ).hexdigest()
+
+
+def consume_rate_limit(
+    visitor_id: str,
+    action: str,
+    limit: int,
+) -> str:
+    now = int(time.time())
+    expires_at = now + RATE_LIMIT_WINDOW_SECONDS
+
+    rate_key = f"{action}#{visitor_id}"
+
+    key = {
+        "rate_key": {
+            "S": rate_key,
+        }
+    }
+
+    # Try twice because another request may reset an
+    # expired window between our conditional operations.
+    for _ in range(2):
+        try:
+            dynamodb_client.update_item(
+                TableName=RATE_LIMIT_TABLE,
+                Key=key,
+                UpdateExpression=(
+                    "SET expires_at = "
+                    "if_not_exists(expires_at, :expires) "
+                    "ADD #count :one"
+                ),
+                ConditionExpression=(
+                    "attribute_not_exists(#count) "
+                    "OR "
+                    "(expires_at > :now AND #count < :limit)"
+                ),
+                ExpressionAttributeNames={
+                    "#count": "count",
+                },
+                ExpressionAttributeValues={
+                    ":one": {
+                        "N": "1",
+                    },
+                    ":limit": {
+                        "N": str(limit),
+                    },
+                    ":now": {
+                        "N": str(now),
+                    },
+                    ":expires": {
+                        "N": str(expires_at),
+                    },
+                },
+            )
+
+            return rate_key
+
+        except ClientError as exc:
+            error_code = exc.response[
+                "Error"
+            ]["Code"]
+
+            if (
+                error_code
+                != "ConditionalCheckFailedException"
+            ):
+                raise HTTPException(
+                    status_code=503,
+                    detail=(
+                        "Demo rate-limit service "
+                        "is temporarily unavailable."
+                    ),
+                ) from exc
+
+        # The first update may have failed because
+        # the existing 24-hour window has expired.
+        try:
+            dynamodb_client.update_item(
+                TableName=RATE_LIMIT_TABLE,
+                Key=key,
+                UpdateExpression=(
+                    "SET #count = :one, "
+                    "expires_at = :expires"
+                ),
+                ConditionExpression=(
+                    "expires_at <= :now"
+                ),
+                ExpressionAttributeNames={
+                    "#count": "count",
+                },
+                ExpressionAttributeValues={
+                    ":one": {
+                        "N": "1",
+                    },
+                    ":now": {
+                        "N": str(now),
+                    },
+                    ":expires": {
+                        "N": str(expires_at),
+                    },
+                },
+            )
+
+            return rate_key
+
+        except ClientError as exc:
+            error_code = exc.response[
+                "Error"
+            ]["Code"]
+
+            if (
+                error_code
+                != "ConditionalCheckFailedException"
+            ):
+                raise HTTPException(
+                    status_code=503,
+                    detail=(
+                        "Demo rate-limit service "
+                        "is temporarily unavailable."
+                    ),
+                ) from exc
+
+    if action == "upload":
+        detail = (
+            "Demo upload limit reached. "
+            "Maximum 2 PDFs per visitor "
+            "every 24 hours."
+        )
+    else:
+        detail = (
+            "Demo question limit reached. "
+            "Maximum 20 questions per visitor "
+            "every 24 hours."
+        )
+
+    raise HTTPException(
+        status_code=429,
+        detail=detail,
+        headers={
+            "Retry-After": str(
+                RATE_LIMIT_WINDOW_SECONDS
+            ),
+        },
+    )
+
+
+def release_rate_limit(rate_key: str) -> None:
+    try:
+        dynamodb_client.update_item(
+            TableName=RATE_LIMIT_TABLE,
+            Key={
+                "rate_key": {
+                    "S": rate_key,
+                }
+            },
+            UpdateExpression=(
+                "ADD #count :minus_one"
+            ),
+            ConditionExpression=(
+                "attribute_exists(#count) "
+                "AND #count > :zero"
+            ),
+            ExpressionAttributeNames={
+                "#count": "count",
+            },
+            ExpressionAttributeValues={
+                ":minus_one": {
+                    "N": "-1",
+                },
+                ":zero": {
+                    "N": "0",
+                },
+            },
+        )
+
+    except ClientError:
+        # Cleanup must never hide the original
+        # upload-processing error.
+        return
 
 
 def create_vector_store(pdf_path: Path, document_id: str) -> int:
@@ -221,7 +437,8 @@ def health():
 
 @app.post("/api/upload")
 async def upload_document(
-    file: UploadFile = File(...)
+    request: Request,
+    file: UploadFile = File(...),
 ):
     if not BUCKET_NAME:
         raise HTTPException(
@@ -236,6 +453,14 @@ async def upload_document(
             status_code=400,
             detail="Only PDF documents are supported.",
         )
+
+    visitor_id = get_visitor_id(request)
+
+    rate_key = consume_rate_limit(
+        visitor_id,
+        "upload",
+        UPLOAD_LIMIT,
+    )
 
     document_id = str(uuid.uuid4())
     session_dir = get_session_directory(document_id)
@@ -263,6 +488,10 @@ async def upload_document(
         )
 
     except HTTPException:
+        release_rate_limit(
+            rate_key,
+        )
+
         shutil.rmtree(
             session_dir,
             ignore_errors=True,
@@ -270,6 +499,10 @@ async def upload_document(
         raise
 
     except Exception as exc:
+        release_rate_limit(
+            rate_key,
+        )
+
         shutil.rmtree(
             session_dir,
             ignore_errors=True,
@@ -296,8 +529,11 @@ async def upload_document(
 
 
 @app.post("/api/ask")
-def ask_question(request: QuestionRequest):
-    question = request.question.strip()
+def ask_question(
+    request: Request,
+    payload: QuestionRequest,
+):
+    question = payload.question.strip()
 
     if not question:
         raise HTTPException(
@@ -305,8 +541,16 @@ def ask_question(request: QuestionRequest):
             detail="Question cannot be empty.",
         )
 
+    visitor_id = get_visitor_id(request)
+
+    consume_rate_limit(
+        visitor_id,
+        "ask",
+        QUESTION_LIMIT,
+    )
+
     vectorstore = load_vector_store(
-        request.document_id
+        payload.document_id
     )
 
     answer = generate_answer(
@@ -315,7 +559,7 @@ def ask_question(request: QuestionRequest):
     )
 
     return {
-        "document_id": request.document_id,
+        "document_id": payload.document_id,
         "question": question,
         "answer": answer,
     }
